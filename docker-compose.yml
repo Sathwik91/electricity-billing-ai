@@ -1,0 +1,228 @@
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: electricity-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: electricity_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - electricity-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: electricity-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - electricity-network
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: electricity-backend
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/electricity_db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - ENVIRONMENT=production
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ml_models:/app/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - electricity-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Celery Worker for Background Tasks
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: electricity-celery-worker
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/electricity_db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    volumes:
+      - ./backend:/app
+      - ml_models:/app/models
+    depends_on:
+      - postgres
+      - redis
+    command: celery -A app.tasks.celery_app worker --loglevel=info
+    networks:
+      - electricity-network
+
+  # Celery Beat for Scheduled Tasks
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: electricity-celery-beat
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/electricity_db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    volumes:
+      - ./backend:/app
+      - ml_models:/app/models
+    depends_on:
+      - postgres
+      - redis
+    command: celery -A app.tasks.celery_app beat --loglevel=info
+    networks:
+      - electricity-network
+
+  # Flower for Celery Monitoring
+  flower:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: electricity-flower
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+      - celery-worker
+    command: celery -A app.tasks.celery_app flower --port=5555
+    networks:
+      - electricity-network
+
+  # React Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: electricity-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000/api/v1
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - electricity-network
+
+  # ML Training Service (runs periodically)
+  ml-trainer:
+    build:
+      context: ./ml-models
+      dockerfile: Dockerfile
+    container_name: electricity-ml-trainer
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/electricity_db
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./ml-models:/app
+      - ml_models:/app/models
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - electricity-network
+    # Run training on startup and then exit (will be scheduled via cron or k8s CronJob)
+    command: python training/train_all_models.py
+
+  # Prometheus for Monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: electricity-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - electricity-network
+
+  # Grafana for Visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: electricity-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infrastructure/monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./infrastructure/monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - electricity-network
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: electricity-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./infrastructure/nginx/ssl:/etc/nginx/ssl
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - electricity-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  ml_models:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  electricity-network:
+    driver: bridge

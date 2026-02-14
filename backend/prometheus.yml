@@ -1,0 +1,21 @@
+# Prometheus Configuration for Electricity Billing System
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: 'electricity-billing'
+    environment: 'development'
+
+scrape_configs:
+  # Backend API metrics (running locally)
+  - job_name: 'fastapi-backend'
+    static_configs:
+      - targets: ['host.docker.internal:8000']  # Docker can reach your local backend
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+
+  # Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
